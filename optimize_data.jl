@@ -2,28 +2,43 @@
 
 using Pkg
 Pkg.add("XLSX")
-using DataFrames, XLSX
+Pkg.add("DataFrameMeta")
+Pkg.add("Missings")
+using DataFrames, XLSX, DataFrameMeta
+using Missings
 
 xf = XLSX.readxlsx("node_stats_for_simulation.xlsx") #xf["BHCs"]["A1:I1"]
-bhc = XLSX.eachtablerow(xf["BHCs"]) |> DataFrames.DataFrame
-describe(bhc)
-names(bhc)
-
+data = vcat( [(XLSX.eachtablerow(xf[s]) |> DataFrames.DataFrame) for s in XLSX.sheetnames(xf)]... )
+data = data[data.w .> 0, :]
+N = size(data,1) # number of nodes
+sort!(data, :assets, rev = true)
 # rescale units
 units = 1e6;
-bhc[:,[:w, :c, :assets, :p_bar, :b]] .= bhc[!,[:w, :c, :assets, :p_bar, :b]]./units
+data[:,[:w, :c, :assets, :p_bar, :b]] .= data[!,[:w, :c, :assets, :p_bar, :b]]./units
+
+# keep track of missing variables
+col_with_miss = names(data)[[any(ismissing.(col)) for col = eachcol(data)]]
+data_nm = dropmissing(data, disallowmissing=true)
+          
+# take a look
+names(data) # column names
+describe(data)
+
+
+colwise(x -> any(ismissing.(x)), data)
+
 
 # network primitives from the data
-p_bar0 = bhc[!,:p_bar] # total liabilities
-c0 = bhc[!,:c] # outside assets
-a0 = bhc[!,:assets] # total assets
-w0 = bhc[!,:w] # net worth
-b0 = bhc[!,:b] # outside liabilities
+p_bar0 = data[!,:p_bar] # total liabilities
+c0 = data[!,:c] # outside assets
+a0 = data[!,:assets] # total assets
+w0 = data[!,:w] # net worth
+b0 = data[!,:b] # outside liabilities
 
 # other primitives
 d0 =  a0 .- c0 # inside assets
 f0 = p_bar0 .- b0;# inside liabilities
-N = length(p_bar0)
+
 
 # parameters
 g0 = 0.0 # bankruptcy cost
@@ -47,15 +62,23 @@ m = Model(Ipopt.Optimizer) # settings for the solver
 
 p0 = p_bar0
 x0 = 0.0*similar(p0)
-A0 = rand(N,N);[A0[i,i]=0.0 for i=1:N];A0=LowerTriangular(A0);
+
+rng = MersenneTwister(1234);
+A0 = rand(rng,N,N);[A0[i,i]=0.0 for i=1:N];A0=LowerTriangular(A0);
 
 @variable(m, 0<=p[i=1:N]<=p0[i], start = p0[i]) 
-#@variable(m, 0<=c[i=1:N]) 
+@variable(m, 0<=c[i=1:N]) 
+@variable(m, 0<=b[i=1:N]) 
+
+fix(v::VariableRef, value::Number; force::Bool = false)
+
 #@variable(m, 0<=x[i=1:N]<=c0[i], start = x0[i])  
 @variable(m, 0<=A[i=1:N, j=1:N]<=1,start=A0[i,j])  # start=A0[i,j]
 
 @constraint(m, sum(A,dims=2).*p_bar0 .== f0) # payments to other nodes add up to inside liabilities f
 @constraint(m, A' * p_bar0 .== d0) # payments from other nodes add up to inside assets d
+
+delete(model, con)
 
 # liabilities are net liabilities: A[i,i]=0 and A[i,j]A[j,i]=0
 @constraint(m, [i = 1:N], A[i,i]==0)
@@ -94,7 +117,6 @@ objective_value(m)
 
 AA = JuMP.value.(A)
 pp = JuMP.value.(p)
-
 
 tol = 1e-6
 @test norm(sum(AA,dims=2).* p_bar0 .- f0) < tol
